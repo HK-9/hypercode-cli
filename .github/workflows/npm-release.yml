@@ -1,0 +1,278 @@
+name: npm release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact SHA from the original version-bump PR merge run; never use current main as a retry target
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: npm-release-publish
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      target_sha: ${{ steps.release.outputs.target_sha }}
+      version: ${{ steps.release.outputs.version }}
+      release_pr: ${{ steps.release.outputs.release_pr }}
+      artifact_name: ${{ steps.pack.outputs.artifact_name }}
+      tarball: ${{ steps.pack.outputs.tarball }}
+      integrity: ${{ steps.pack.outputs.integrity }}
+      already_published: ${{ steps.registry.outputs.already_published }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.sha || inputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: npm
+      - name: Select the immutable merged release commit
+        id: release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_SHA_INPUT: ${{ inputs.release_sha }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { execFileSync } = require('node:child_process');
+            const target = context.eventName === 'push'
+              ? context.sha
+              : process.env.RELEASE_SHA_INPUT;
+            if (!/^[0-9a-f]{40}$/i.test(target ?? '')) {
+              core.setFailed('Provide the exact 40-character release SHA when manually retrying.');
+              return;
+            }
+            const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+            if (head !== target) {
+              core.setFailed(`Checkout ${head} does not match immutable target ${target}.`);
+              return;
+            }
+            execFileSync('git', ['fetch', 'origin', 'main'], { stdio: 'inherit' });
+            try {
+              execFileSync('git', ['merge-base', '--is-ancestor', target, 'FETCH_HEAD']);
+            } catch {
+              core.setFailed(`Target ${target} is not reachable from origin/main.`);
+              return;
+            }
+            const associated = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              { owner: context.repo.owner, repo: context.repo.repo, commit_sha: target, per_page: 100 }
+            );
+            const source = associated.filter((pr) =>
+              pr.merged_at && pr.base.ref === 'main' &&
+              pr.head.ref === 'changeset-release/main' &&
+              pr.head.repo?.full_name === `${context.repo.owner}/${context.repo.repo}`
+            );
+            if (source.length !== 1) {
+              if (context.eventName === 'workflow_dispatch') {
+                core.setFailed(`Expected exactly one merged Changesets release PR for ${target}; found ${source.length}.`);
+              } else {
+                core.info(`Commit ${target} is not a Changesets version-PR merge; publishing is skipped.`);
+                core.setOutput('publish', 'false');
+              }
+              return;
+            }
+            const parent = execFileSync('git', ['rev-parse', `${target}^1`], { encoding: 'utf8' }).trim();
+            const oldPackage = JSON.parse(execFileSync('git', ['show', `${parent}:package.json`], { encoding: 'utf8' }));
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            if (pkg.name !== 'hypercode-init') {
+              core.setFailed(`Unexpected package identity ${pkg.name}.`);
+              return;
+            }
+            const parse = (value) => {
+              const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(value ?? '');
+              return match ? match.slice(1).map(Number) : null;
+            };
+            const before = parse(oldPackage.version);
+            const current = parse(pkg.version);
+            if (!before || !current) {
+              core.setFailed('Only stable numeric x.y.z versions can be released.');
+              return;
+            }
+            if (current.every((part, index) => part === before[index])) {
+              if (context.eventName === 'workflow_dispatch') {
+                core.setFailed(`Release commit ${target} does not change package version ${pkg.version}.`);
+              } else {
+                core.info(`Release PR merged without a package version bump; publishing is skipped.`);
+                core.setOutput('publish', 'false');
+              }
+              return;
+            }
+            const increased = current.some((part, index) =>
+              part > before[index] && current.slice(0, index).every((prefix, p) => prefix === before[p])
+            ) && current.slice(current.findIndex((part, index) => part !== before[index]) + 1).every((part) => part === 0);
+            if (!increased || current.findIndex((part, index) => part !== before[index]) < 0 ||
+                current.slice(0, current.findIndex((part, index) => part !== before[index])).some((part, index) => part !== before[index])) {
+              core.setFailed(`Version ${oldPackage.version} -> ${pkg.version} is not an increasing Changesets release.`);
+              return;
+            }
+            if (pkg.version === '0.1.0') {
+              core.setFailed('Refusing to republish the already-published initial version 0.1.0.');
+              return;
+            }
+            core.setOutput('publish', 'true');
+            core.setOutput('target_sha', target);
+            core.setOutput('version', pkg.version);
+            core.setOutput('release_pr', String(source[0].number));
+            core.info(`Verified version PR #${source[0].number}: ${oldPackage.version} -> ${pkg.version} at ${target}.`);
+
+      - name: Install trusted workflow tooling and dependencies
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          npm install --global npm@11.5.1
+          npm ci
+      - name: Validate release metadata
+        if: steps.release.outputs.publish == 'true'
+        run: npm run validate:release
+      - name: Test the exact release commit
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          npm run check
+          npm test
+          npm run test:package
+      - name: Pack and inspect the exact public artifact
+        if: steps.release.outputs.publish == 'true'
+        id: pack
+        run: |
+          npm pack --json > pack.json
+          node scripts/inspect-release-pack.js pack.json "$GITHUB_OUTPUT"
+      - name: Check public registry state
+        if: steps.release.outputs.publish == 'true'
+        id: registry
+        run: node scripts/check-release-registry.js "${{ steps.release.outputs.version }}" "${{ steps.pack.outputs.integrity }}" "$GITHUB_OUTPUT"
+      - name: Build release notes from the reviewed Changesets PR
+        if: steps.release.outputs.publish == 'true'
+        uses: actions/github-script@v7
+        env:
+          RELEASE_PR: ${{ steps.release.outputs.release_pr }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const prNumber = Number(process.env.RELEASE_PR);
+            const { owner, repo } = context.repo;
+            const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            if (!pr.data.merged || pr.data.head.ref !== 'changeset-release/main' || pr.data.base.ref !== 'main') {
+              core.setFailed('The linked source is not the merged Changesets release PR.');
+              return;
+            }
+            const marker = '<!-- hypercode-source-pull-requests -->';
+            const body = pr.data.body ?? '';
+            const start = body.indexOf(marker);
+            const end = start < 0 ? -1 : body.indexOf(marker, start + marker.length);
+            const section = start < 0 || end < 0 ? '' : body.slice(start + marker.length, end);
+            const links = [...section.matchAll(/- \[#(\d+)\]\((https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+)\)/g)]
+              .map((match) => ({ number: Number(match[1]), url: match[2] }))
+              .filter((item) => item.url === `https://github.com/${owner}/${repo}/pull/${item.number}`);
+            fs.writeFileSync('source-pull-requests.json', JSON.stringify(links), { flag: 'wx' });
+            core.info(`Collected ${links.length} linked source PR(s) for release notes.`);
+      - name: Extract the exact Changesets changelog entry
+        if: steps.release.outputs.publish == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: node scripts/release-notes.js "$RELEASE_VERSION" source-pull-requests.json release-notes.md
+      - name: Upload the checked tarball and release notes
+        if: steps.release.outputs.publish == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-release-${{ steps.release.outputs.version }}
+          path: |
+            ${{ steps.pack.outputs.tarball }}
+            pack.json
+            release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-release
+      url: https://www.npmjs.com/package/hypercode-init
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.target_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          package-manager-cache: false
+      - name: Install npm trusted-publishing-compatible CLI
+        run: npm install --global npm@11.5.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-release-${{ needs.prepare.outputs.version }}
+          path: release-artifact
+      - name: Verify the immutable release artifact
+        id: verify
+        run: node scripts/verify-release-artifact.js "release-artifact/${{ needs.prepare.outputs.tarball }}" "release-artifact/pack.json" "${{ needs.prepare.outputs.version }}" "${{ needs.prepare.outputs.integrity }}" "$GITHUB_OUTPUT"
+      - name: Recheck npm registry before any publish
+        id: registry
+        run: node scripts/check-release-registry.js "${{ needs.prepare.outputs.version }}" "${{ needs.prepare.outputs.integrity }}" "$GITHUB_OUTPUT"
+      - name: Publish the checked artifact with npm trusted publishing
+        if: steps.registry.outputs.already_published != 'true'
+        run: npm publish "release-artifact/${{ needs.prepare.outputs.tarball }}" --access public
+      - name: Verify public npm version and integrity
+        run: node scripts/verify-published-release.js "${{ needs.prepare.outputs.version }}" "${{ needs.prepare.outputs.integrity }}"
+      - name: Record the verified GitHub release and source links
+        uses: actions/github-script@v7
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.target_sha }}
+          RELEASE_NOTES: release-artifact/release-notes.md
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { owner, repo } = context.repo;
+            const version = process.env.RELEASE_VERSION;
+            const sha = process.env.RELEASE_SHA;
+            const tag = `v${version}`;
+            const { data: refs } = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` }).catch((error) => {
+              if (error.status === 404) return { data: null };
+              throw error;
+            });
+            if (refs) {
+              let object = refs.object;
+              while (object.type === 'tag') object = (await github.rest.git.getTag({ owner, repo, tag_sha: object.sha })).data.object;
+              if (object.type !== 'commit' || object.sha !== sha) {
+                core.setFailed(`Existing ${tag} does not point to immutable release commit ${sha}; refusing to move it.`);
+                return;
+              }
+            }
+            const body = fs.readFileSync(process.env.RELEASE_NOTES, 'utf8');
+            const existing = await github.rest.repos.getReleaseByTag({ owner, repo, tag }).catch((error) => {
+              if (error.status === 404) return { data: null };
+              throw error;
+            });
+            if (existing.data) {
+              if (!refs) {
+                core.setFailed(`Existing GitHub release ${tag} has no corresponding immutable tag ref.`);
+                return;
+              }
+              await github.rest.repos.updateRelease({ owner, repo, release_id: existing.data.id, name: tag, body });
+            } else {
+              await github.rest.repos.createRelease({
+                owner, repo, tag_name: tag, target_commitish: sha, name: tag, body,
+                draft: false, prerelease: false,
+              });
+            }
+            core.info(`Recorded verified npm release ${tag} from ${sha}.`);

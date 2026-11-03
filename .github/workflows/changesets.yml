@@ -1,0 +1,94 @@
+name: Changesets
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: changesets-main
+  cancel-in-progress: false
+
+jobs:
+  version-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: npm
+      - run: npm ci
+      - name: Create or update the bot-authored release PR
+        uses: changesets/action@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          version: npm run release:version
+          title: Version Packages
+          commit: Version Packages
+          setupGitUser: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Link source pull requests and dispatch CI for the bot branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const base = 'main';
+            const releaseBranch = `changeset-release/${base}`;
+            const openPulls = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', base, per_page: 100,
+            });
+            const releasePr = openPulls.find((pr) =>
+              pr.head.ref === releaseBranch && pr.head.repo?.full_name === `${owner}/${repo}`
+            );
+            if (!releasePr) {
+              core.info('No Changesets release PR exists; no dispatch is needed.');
+              return;
+            }
+
+            const closed = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'closed', base, per_page: 100, sort: 'updated', direction: 'desc',
+            });
+            const priorRelease = closed
+              .filter((pr) => pr.merged_at && pr.head.ref === releaseBranch)
+              .sort((a, b) => Date.parse(b.merged_at) - Date.parse(a.merged_at))[0];
+            const since = priorRelease ? Date.parse(priorRelease.merged_at) : 0;
+            const sourcePulls = [];
+            for (const pr of closed) {
+              if (!pr.merged_at || Date.parse(pr.merged_at) <= since ||
+                  pr.head.ref === releaseBranch || pr.base.ref !== base) continue;
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: pr.number, per_page: 100,
+              });
+              if (files.some((file) => /^\.changeset\/[^/]+\.md$/.test(file.filename))) sourcePulls.push(pr);
+            }
+            sourcePulls.sort((a, b) => a.number - b.number);
+            const marker = '<!-- hypercode-source-pull-requests -->';
+            const links = sourcePulls.length
+              ? sourcePulls.map((pr) => `- [#${pr.number}](${pr.html_url}) ${pr.title}`).join('\n')
+              : '- No merged source PR with a Changeset was found since the previous release PR.';
+            const section = `${marker}\n### Source pull requests\n\n${links}\n\n${marker}`;
+            const current = releasePr.body ?? '';
+            const body = current.includes(marker)
+              ? current.replace(new RegExp(`${escapeRegExp(marker)}[\\s\\S]*?${escapeRegExp(marker)}`), section)
+              : `${current.trim()}\n\n${section}`;
+            await github.rest.pulls.update({ owner, repo, pull_number: releasePr.number, body });
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: 'ci.yml', ref: releaseBranch,
+              inputs: { purpose: `Changesets release PR #${releasePr.number}` },
+            });
+            core.info(`Dispatched hypercode-ci.yml on ${releaseBranch} for release PR #${releasePr.number}.`);
+
+            function escapeRegExp(value) {
+              return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            }

@@ -1,0 +1,1 @@
+pywinpty>=3,<4; sys_platform == "win32"
